@@ -86,13 +86,29 @@ jobs:
           du -sh "$APP"
           plutil -extract CFBundleIdentifier raw "$APP/Contents/Info.plist"
 
+      # Spotlight indexes a freshly created staging image past hdiutil's detach
+      # retries ("Resource busy"). Upstream's release lane disables indexing
+      # before staging a DMG for the same reason.
+      - name: Disable Spotlight indexing for DMG staging
+        run: sudo mdutil -a -i off || true
+
       - name: Archive the bundle
         run: |
           set -euo pipefail
           APP="apps/desktop/release/mac/Hermes.app"
           mkdir -p out
+          STAGE="$RUNNER_TEMP/dmg-stage"
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+          ditto "$APP" "$STAGE/Hermes.app"
+          # The zip is the artifact users actually need; a DMG failure must not
+          # discard it, so build the DMG last and report it separately.
           ditto -c -k --sequesterRsrc --keepParent "$APP" out/Hermes-macos-x64.zip
-          hdiutil create -volname Hermes -srcfolder "$APP" -ov -format UDZO out/Hermes-macos-x64.dmg
+          if hdiutil create -volname Hermes -srcfolder "$STAGE" -ov -format UDZO out/Hermes-macos-x64.dmg; then
+            echo "DMG created"
+          else
+            echo "::warning::hdiutil failed; shipping the zip only"
+            rm -f out/Hermes-macos-x64.dmg
+          fi
           ( cd out && shasum -a 256 * > SHA256SUMS.txt )
           ls -lh out
 
