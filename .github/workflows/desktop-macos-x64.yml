@@ -1,0 +1,116 @@
+# Build the Hermes Desktop app for Intel macOS (x86_64).
+#
+# Upstream's release matrix only builds darwin-arm64; there is no Intel macOS
+# leg and no Intel desktop bundle in any feed. This workflow runs the same
+# in-tree preparation the release lanes use -- PM's locked toolchain, the
+# locked Electron runtime, then the source desktop build -- on a GitHub-hosted
+# Intel runner, and publishes the packaged .app as a zip and a dmg.
+name: Desktop (macOS x64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'HERMES_DESKTOP_VARIANT (empty = bootstrap shell, bundled = self-contained runtime)'
+        type: string
+        default: ''
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-macos-x64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Package Hermes.app (macos-15-intel)
+    runs-on: macos-15-intel
+    timeout-minutes: 300
+    env:
+      CI: '1'
+      # No Developer ID on a fork runner: ad-hoc sign the local rebuild.
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      HERMES_DESKTOP_VARIANT: ${{ inputs.variant }}
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Report the host
+        run: |
+          set -euo pipefail
+          uname -m
+          sw_vers
+          xcode-select -p
+
+      # PM installs its pinned Python, Node, npm, pnpm, just, ffmpeg and
+      # ripgrep from pm/lock.json, plus the application dependency environment
+      # the icon and payload generators run on.
+      - name: Prepare the locked toolchain
+        id: pm
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: all
+          extras: '[]'
+          test-environment: 'true'
+
+      - name: Install the locked JS workspaces
+        uses: ./.github/actions/retry
+        with:
+          command: just js-install
+
+      - name: Prepare the locked Electron runtime
+        run: just electron-runtime
+
+      - name: Build the desktop app
+        env:
+          HERMES_PYTHON: ${{ steps.pm.outputs.python-path }}
+        run: just desktop-build
+
+      # electron-builder --dir: an unpacked .app, no installer format, no
+      # publish. The packaging preparer acquires its pinned archives itself.
+      - name: Package the desktop app
+        env:
+          HERMES_PYTHON: ${{ steps.pm.outputs.python-path }}
+        run: pnpm --dir apps/desktop run builder --dir --publish never --mac
+
+      - name: Inspect the packaged bundle
+        run: |
+          set -euo pipefail
+          APP="apps/desktop/release/mac/Hermes.app"
+          test -d "$APP"
+          file "$APP/Contents/MacOS/Hermes"
+          du -sh "$APP"
+          plutil -extract CFBundleIdentifier raw "$APP/Contents/Info.plist"
+
+      - name: Archive the bundle
+        run: |
+          set -euo pipefail
+          APP="apps/desktop/release/mac/Hermes.app"
+          mkdir -p out
+          ditto -c -k --sequesterRsrc --keepParent "$APP" out/Hermes-macos-x64.zip
+          hdiutil create -volname Hermes -srcfolder "$APP" -ov -format UDZO out/Hermes-macos-x64.dmg
+          ( cd out && shasum -a 256 * > SHA256SUMS.txt )
+          ls -lh out
+
+      - name: Upload the app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: Hermes-macos-x64
+          path: out/*
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-macos-x64
+          path: |
+            apps/desktop/release/*.log
+            ~/.hermes/logs/**
+          retention-days: 7
+          if-no-files-found: ignore
