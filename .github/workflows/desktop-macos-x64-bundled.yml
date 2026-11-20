@@ -1,0 +1,155 @@
+# Build a self-contained ("bundled") Hermes Desktop app for Intel macOS.
+#
+# The bootstrap variant packages an app shell that expects an existing CLI
+# install; the bundled variant carries the runtime (CPython, uv, the app
+# dependency generation, TUI/dashboard assets) so the .app runs on its own.
+#
+# Upstream builds bundled darwin-arm64 only. This lane runs the same in-tree
+# driver (scripts/bundles/desktop.py) on a GitHub-hosted Intel runner and
+# publishes the DMG/ZIP to a Release, whose assets download far faster than
+# workflow artifacts.
+name: Desktop bundled (macOS x64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Tag for the created Release (empty = desktop-bundled-x64-<run number>)'
+        type: string
+        default: ''
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-bundled-macos-x64-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Bundle Hermes.app (macos-15-intel)
+    runs-on: macos-15-intel
+    timeout-minutes: 360
+    env:
+      CI: '1'
+      PYTHONUTF8: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      # No Developer ID on a fork runner: electron-builder ad-hoc signs.
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Report the host
+        run: |
+          set -euo pipefail
+          uname -m
+          sw_vers
+          xcode-select -p
+          git rev-parse HEAD
+
+      # Spotlight indexes a freshly staged DMG image past hdiutil's detach
+      # retries ("Resource busy"); the release lane disables it for this reason.
+      - name: Disable Spotlight indexing for DMG staging
+        run: sudo mdutil -a -i off || true
+
+      # PM's locked toolchain: pinned Python, Node, pnpm, just, ffmpeg,
+      # ripgrep, plus the application dependency environment the icon, TUI,
+      # dashboard and payload generators run on.
+      - name: Prepare the locked toolchain
+        id: pm
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: all
+          extras: '[]'
+          test-environment: 'true'
+
+      # Stage every dependency the packaging step consumes: workspace
+      # node_modules, native addons, the packaging tools, the icon environment
+      # and the runnable agent payload.
+      - name: Prepare the complete desktop build
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/bundles/desktop.py \
+            --commit "$(git rev-parse HEAD)" \
+            --variant bundled --prepare-only \
+            --work "$RUNNER_TEMP/desktop-job" \
+            --cache "$GITHUB_WORKSPACE/.cache/desktop-inputs"
+          python -m scripts.ci.desktop_commands "$RUNNER_TEMP/desktop-job/prepared.json"
+
+      - name: Build and package
+        shell: bash
+        timeout-minutes: 300
+        run: |
+          set -euo pipefail
+          ulimit -n 16384 2>/dev/null || true
+          echo "file descriptor limit: soft=$(ulimit -Sn)"
+          python scripts/bundles/desktop.py --prepared "$RUNNER_TEMP/desktop-job/prepared.json" --variant bundled
+
+      - name: Audit the packaged bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apps=(apps/desktop/release/mac*/*.app)
+          if [ ${#apps[@]} -eq 0 ]; then echo "::error::no packed .app found"; exit 1; fi
+          for app in "${apps[@]}"; do
+            echo "== $app"
+            du -sh "$app"
+            file "$app/Contents/MacOS/Hermes"
+            plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist"; echo
+            python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print('payload:',d.get('payload'),'commit:',d.get('commit'),'dirty:',d.get('dirty'))" "$app/Contents/Resources/install-stamp.json"
+            test -d "$app/Contents/Resources/agent-payload" && echo "agent-payload: present" || { echo "::error::bundled app has no agent-payload"; exit 1; }
+          done
+          ls -lh apps/desktop/release/*.dmg apps/desktop/release/*.zip 2>/dev/null || true
+
+      - name: Assemble the release artifacts
+        id: artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          shopt -s nullglob
+          files=(apps/desktop/release/*.dmg apps/desktop/release/*.zip)
+          if [ ${#files[@]} -eq 0 ]; then echo "::error::electron-builder produced no dmg or zip"; exit 1; fi
+          for f in "${files[@]}"; do cp "$f" out/; done
+          ( cd out && shasum -a 256 * > SHA256SUMS.txt )
+          ls -lh out
+          tag="${{ inputs.release_tag }}"
+          [ -n "$tag" ] || tag="desktop-bundled-x64-${{ github.run_number }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.artifacts.outputs.tag }}"
+          gh release create "$tag" out/* \
+            --repo "${{ github.repository }}" \
+            --title "Hermes Desktop (macOS x64, bundled) $tag" \
+            --notes "Self-contained Hermes Desktop build for Intel macOS.
+
+          Built from `${{ github.sha }}` by workflow run ${{ github.run_number }}.
+
+          * `Hermes-*.dmg` — disk image
+          * `Hermes-*.zip` — zipped .app
+          * `SHA256SUMS.txt` — checksums
+
+          Unsigned (ad-hoc signature); macOS Gatekeeper will ask for confirmation on first launch: right-click the app → Open, or `xattr -dr com.apple.quarantine Hermes.app`."
+          echo "release: https://github.com/${{ github.repository }}/releases/tag/$tag"
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-bundled-x64
+          path: |
+            ~/.hermes/logs/**
+            apps/desktop/release/*.log
+          retention-days: 7
+          if-no-files-found: ignore
